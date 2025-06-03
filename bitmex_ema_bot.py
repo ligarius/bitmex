@@ -1,123 +1,131 @@
-#!/usr/bin/python3
-import requests
+#!/usr/bin/env python3
+"""Simple EMA based trading bot for BitMEX."""
+
 import json
-from datetime import datetime, timedelta
-import pandas as pd
+import logging
+import os
 import time
+from datetime import datetime, timedelta
+
 import ccxt
-import sys
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
-LOT = 100
-CLOSE_RANGE = 30
-STOP_RANGE = 20
+load_dotenv()
 
-# api・シークレットキーを記入
+# Trading parameters can be overridden with environment variables
+LOT = int(os.getenv("LOT", 100))
+CLOSE_RANGE = int(os.getenv("CLOSE_RANGE", 30))
+STOP_RANGE = int(os.getenv("STOP_RANGE", 20))
+
 bitmex = ccxt.bitmex({
-    'apiKey': 'xxxxxxxxxx',
-    'secret': 'xxxxxxxxxx',
+    "apiKey": os.getenv("BITMEX_API_KEY", ""),
+    "secret": os.getenv("BITMEX_API_SECRET", ""),
 })
-# testnetで使用する場合は下記コメントアウトを外す
-# bitmex.urls['api'] = bitmex.urls['test']
 
-def limit(side, price, size):
-    return bitmex.create_order('BTC/USD', type='limit', side=side, price=price, amount=size)
+# Use testnet if BITMEX_TESTNET=1
+if os.getenv("BITMEX_TESTNET") == "1":
+    bitmex.urls["api"] = bitmex.urls["test"]
 
-def market(side, size):
-    return bitmex.create_order('BTC/USD', type='market', side=side, amount=size)
-
-# dataframe for executions
-df = pd.DataFrame(columns=['exectime', 
-                           'open', 
-                           'high', 
-                           'low', 
-                           'close', 
-                           'price', 
-                           'volume'])
-
-#ローソク足の時間を指定
-periods = ["60"]
-
-# after以降のデータを取得(after = 10分前)
-after = (datetime.now() - timedelta(minutes=10)).strftime('%s')
-
-#クエリパラメータを指定    
-query = {"periods":','.join(periods)}
-query['after'] = ''.join(after)
-
-def get_ema():
-    #ローソク足取得
-    result = json.loads(requests.get("https://api.cryptowat.ch/markets/bitmex/btcusd-perpetual-futures/ohlc",params=query).text)["result"]
-
-    # add to dataframe
-    for period in periods:
-        row = result[period]
-        df = pd.DataFrame(row,
-                          columns=['exectime', 
-                                   'open', 
-                                   'high', 
-                                   'low', 
-                                    'close', 
-                                   'price', 
-                                   'volume'])
-        
-    # 平滑化係数(0~1を指定、1に近いほど現在の価格比重が重くなる)
-    alpha = 0.15
-    # emaの計算 ※pandasバージョン0.18.0以上
-    ema = df['close'].ewm(alpha=alpha).mean()[-1:]
-    # print("ema: %s" % ema)
-    return ema
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
-entryPrice = 0
-openId = ''
-closeId = ''
-# while
-while True:
-    try:
-        print("==========")
-        print("entryPrice: " + str(entryPrice))
-        print("openId: " + str(openId))
-        print("closeId: " + str(closeId))
-        last = bitmex.fetch_ticker('BTC/USD')['last']
-        print('last price: ' + str(last))
-    
-        open_orders = bitmex.fetch_open_orders()
-        position = bitmex.private_get_position()
-        # if Active Orderがない場合
-        if open_orders == []:
-            # if ポジションを持っていない場合
-            if position == [] or position[0]['currentQty'] == 0:
-                print('No Position')
-                ema = get_ema().values[0]
-                print("ema: " + str(ema))
-                # if 最後の約定価格がemaより高い
-                if last >= ema:
-                    # 買いポジションでエントリー
-                    entryPrice = last - 2
-                    order = limit('buy', entryPrice, LOT)
-                    print("buy entry")
-                    openId = order['id']
+def limit(side: str, price: float, size: int):
+    """Place a limit order."""
+    return bitmex.create_order(
+        "BTC/USD", type="limit", side=side, price=price, amount=size
+    )
 
-            # elif 買いポジションを持っている場合
-            elif position[0]['currentQty'] >= LOT:
-                # エントリーポイント + CLOSE_RANGE で指値
-                order = limit('sell', entryPrice + CLOSE_RANGE, LOT)
-                print('position close')
-                closeId = order['id']
-        
-        # if エントリーポイント - STOP_RANGE なら損切り
-        if position[0]['currentQty'] >= LOT and last <= (entryPrice - STOP_RANGE):
-            market('sell', LOT)
-            print('loss cut')
-            order = bitmex.cancel_order(closeId)
-            print('order cancel')
-    
-        # if エントリー注文を出して1分以上経過した場合、注文を取り消す
-        if open_orders != [] and open_orders[0]['id'] == openId and datetime.now() - timedelta(minutes=1) > datetime.fromtimestamp(int(str(open_orders[0]['timestamp'])[0:10])):
-            cancel = bitmex.cancel_order(openId)
-            print("order cancel")
-            
-    except Exception as e:
-        print("error: {0}".format(e))
 
-    time.sleep(10)
+def market(side: str, size: int):
+    """Place a market order."""
+    return bitmex.create_order("BTC/USD", type="market", side=side, amount=size)
+
+
+def fetch_candles():
+    """Fetch recent candles from Cryptowatch."""
+    after = (datetime.now() - timedelta(minutes=10)).strftime("%s")
+    query = {"periods": "60", "after": after}
+    resp = requests.get(
+        "https://api.cryptowat.ch/markets/bitmex/btcusd-perpetual-futures/ohlc",
+        params=query,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()["result"]["60"]
+
+
+def calculate_ema(closes, alpha: float = 0.15) -> float:
+    """Return the last EMA value from a list of closes."""
+    df = pd.DataFrame({"close": closes})
+    return df["close"].ewm(alpha=alpha).mean().iloc[-1]
+
+
+def get_ema() -> float:
+    """Retrieve candles and compute EMA."""
+    rows = fetch_candles()
+    closes = [r[4] for r in rows]
+    return calculate_ema(closes)
+
+def run() -> None:
+    """Main trading loop."""
+    entry_price = 0
+    open_id = ""
+    close_id = ""
+
+    while True:
+        try:
+            logger.info(
+                "entryPrice=%s openId=%s closeId=%s", entry_price, open_id, close_id
+            )
+            last = bitmex.fetch_ticker("BTC/USD")["last"]
+            logger.info("last price: %s", last)
+
+            open_orders = bitmex.fetch_open_orders()
+            position = bitmex.private_get_position()
+
+            if not open_orders:
+                if not position or position[0]["currentQty"] == 0:
+                    ema = get_ema()
+                    logger.info("ema: %s", ema)
+                    if last >= ema:
+                        entry_price = last - 2
+                        order = limit("buy", entry_price, LOT)
+                        open_id = order["id"]
+                        logger.info("buy entry: %s", order)
+                elif position[0]["currentQty"] >= LOT:
+                    order = limit("sell", entry_price + CLOSE_RANGE, LOT)
+                    close_id = order["id"]
+                    logger.info("position close: %s", order)
+
+            if position and position[0]["currentQty"] >= LOT and last <= (
+                entry_price - STOP_RANGE
+            ):
+                market("sell", LOT)
+                logger.info("loss cut")
+                bitmex.cancel_order(close_id)
+
+            if open_orders and open_orders[0]["id"] == open_id:
+                order_time = datetime.fromtimestamp(
+                    int(str(open_orders[0]["timestamp"])[0:10])
+                )
+                if datetime.now() - timedelta(minutes=1) > order_time:
+                    bitmex.cancel_order(open_id)
+                    logger.info("order cancel")
+
+        except Exception as e:  # pragma: no cover - network errors
+            logger.error("error: %s", e)
+
+        time.sleep(10)
+
+
+
+if __name__ == "__main__":
+    run()
+
